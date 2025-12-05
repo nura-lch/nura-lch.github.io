@@ -117,27 +117,11 @@
                 this.toggleMode = this.toggleMode.bind(this);
                 this.updateUI = this.updateUI.bind(this);
                 this.calculateResults = this.calculateResults.bind(this);
+                this.handleARStartClick = this.handleARStartClick.bind(this);
 
                 // Setup Listeners
-                this.arStartBtn.addEventListener('click', () => {
-                    // Try to enter AR mode, and catch any errors to display a helpful message
-                    this.scene.components.webxr.enterAR().then(() => {
-                        // Success handled in onSessionStart
-                    }).catch(error => {
-                        console.error('AR Session Failed to Start:', error);
-                        let errorMessage = 'AR Session failed. Possible reasons: Missing camera/motion permission, or browser not compatible.';
-                        
-                        // Refine error message based on the exception
-                        if (error.message && error.message.includes('permission')) {
-                            errorMessage = 'AR Session Failed: Camera or Motion sensor permission likely denied.';
-                        } else if (error.name === 'NotSupportedError') {
-                            errorMessage = 'AR Session Failed: Device/Browser does not support the required WebXR features (hit-test/AR mode).';
-                        }
-                        
-                        // Updated status text color to be dark red for contrast on white background
-                        this.statusText.innerHTML = `<span class="text-red-700">Error: ${errorMessage}</span>`;
-                    });
-                });
+                // The AR start button now calls the new handler method
+                this.arStartBtn.addEventListener('click', this.handleARStartClick);
 
                 this.scene.addEventListener('enter-vr', this.onSessionStart);
                 this.scene.addEventListener('exit-vr', () => {
@@ -148,6 +132,61 @@
                 document.body.addEventListener('click', this.onTap);
 
                 this.updateUI();
+            },
+
+            /**
+             * Handles the AR start click, requesting necessary device permissions first.
+             * This specifically addresses the iOS/Safari Device Motion permission issue.
+             */
+            handleARStartClick: async function() {
+                // Temporarily disable button to prevent double-click
+                this.arStartBtn.disabled = true;
+                this.statusText.innerHTML = "Requesting permissions...";
+
+                const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) && !window.MSStream;
+
+                if (isIOS && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    // This is iOS 13+ and requires explicit permission for device motion
+                    try {
+                        const permissionState = await DeviceOrientationEvent.requestPermission();
+                        if (permissionState === 'granted') {
+                            this.statusText.innerHTML = `<span class="text-green-700">Device Motion granted. Starting AR...</span>`;
+                            this.startARSession();
+                        } else {
+                            this.statusText.innerHTML = `<span class="text-red-700">Error: Device Motion permission denied. AR cannot start.</span>`;
+                            this.arStartBtn.disabled = false;
+                        }
+                    } catch (error) {
+                         this.statusText.innerHTML = `<span class="text-red-700">Permission Error: Could not request Device Motion. ${error.message}.</span>`;
+                         this.arStartBtn.disabled = false;
+                    }
+                } else {
+                    // Non-iOS or older iOS versions don't need this step, proceed directly
+                    this.statusText.innerHTML = "Permissions OK. Starting AR Session...";
+                    this.startARSession();
+                }
+            },
+
+            /**
+             * Attempts to initiate the WebXR AR session.
+             */
+            startARSession: function() {
+                this.scene.components.webxr.enterAR().then(() => {
+                    // Success handled in onSessionStart
+                }).catch(error => {
+                    console.error('AR Session Failed to Start:', error);
+                    let errorMessage = 'AR Session failed. Possible reasons: Missing camera/motion permission, or browser not compatible.';
+                    
+                    if (error.message && error.message.includes('permission')) {
+                        errorMessage = 'AR Session Failed: Camera or Motion sensor permission likely denied.';
+                    } else if (error.name === 'NotSupportedError') {
+                        errorMessage = 'AR Session Failed: Device/Browser does not support the required WebXR features (hit-test/AR mode).';
+                    }
+                    
+                    // Display error in the readable UI box
+                    this.statusText.innerHTML = `<span class="text-red-700">Error: ${errorMessage}</span>`;
+                    this.arStartBtn.disabled = false;
+                });
             },
 
             tick: function () {
@@ -171,7 +210,7 @@
                 if (evt.detail.session.mode === 'immersive-ar') {
                     this.state.isARActive = true;
                     // Updated status text color to be dark green for contrast on white background
-                    this.statusText.innerHTML = `<span class="text-green-700">AR Active. Move your phone slowly to find a surface (green reticle).</span>`;
+                    this.statusText.innerHTML = `<span class="text-green-700">AR Active! Move your phone slowly to find a surface (green reticle).</span>`;
                     this.updateUI();
                 }
             },
