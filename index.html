@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebAR Paint Planner</title>
+    <!-- Tailwind CSS for modern styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <!-- A-Frame Library (Built on Three.js) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/aframe/1.4.2/aframe.min.js"></script>
+
+    <style>
+        /* Hide the A-Frame boilerplate UI elements we don't need */
+        #webxr-button {
+            display: none !important;
+        }
+        .a-canvas {
+            touch-action: none; /* Prevents touch scrolling interfering with AR controls */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 font-sans text-white h-screen overflow-hidden">
+
+    <!-- AR SCENE -->
+    <!-- The ar-modes array is crucial: 'ar' enables markerless tracking (SLAM) -->
+    <a-scene 
+        id="ar-scene"
+        webxr="requiredFeatures: [hit-test, local-floor]; optionalFeatures: [dom-overlay]; referenceSpaceType: local;"
+        ar-toolkit-controller>
+        
+        <!-- The reticle will stick to surfaces via hit-testing -->
+        <a-entity 
+            id="reticle" 
+            geometry="primitive: ring; radiusOuter: 0.1; radiusInner: 0.08" 
+            material="color: limegreen; shader: flat; side: double; opacity: 0.8" 
+            visible="false" 
+            raycaster="objects: [raycastable];" 
+            cursor="rayOrigin: mouse">
+        </a-entity>
+        
+        <!-- Camera must be part of the scene -->
+        <a-camera position="0 1.6 0"></a-camera>
+    </a-scene>
+
+    <!-- UI Overlay for Controls and Results -->
+    <div id="ui-overlay" class="fixed inset-0 flex flex-col pointer-events-none z-10 p-4">
+        
+        <!-- Header/Status - Changed to WHITE background and DARK text for high contrast -->
+        <div class="w-full max-w-lg mx-auto bg-white/90 backdrop-blur-sm p-4 rounded-xl shadow-2xl pointer-events-auto mb-4">
+            <div id="status-text" class="text-sm font-semibold text-gray-900">
+                Tap 'Start AR' below.
+            </div>
+            <div id="result-display" class="mt-2 text-xs text-gray-700 space-y-1">
+                <p id="length-display">Measured Length: 0.00 m</p>
+                <p id="volume-display">Paint Volume (2 coats): 0.00 Liters</p>
+            </div>
+        </div>
+
+        <!-- Main Controls (Mode Switch & AR Start) -->
+        <div class="flex-grow"></div>
+        
+        <div class="w-full max-w-md mx-auto flex justify-center space-x-4 p-3 bg-gray-800/80 rounded-xl shadow-2xl pointer-events-auto">
+            
+            <!-- Mode Switch Button -->
+            <button id="mode-switch-btn" class="flex-1 px-4 py-3 text-sm font-bold rounded-xl shadow-md transition-all duration-200 
+                                                bg-green-600 hover:bg-green-700 text-white opacity-0 disabled:opacity-50"
+                    disabled>
+                Mode: MEASURE (Tap to set points)
+            </button>
+            
+            <!-- AR Start Button -->
+            <button id="ar-start-btn" class="px-6 py-3 text-lg font-extrabold rounded-xl shadow-xl transition-all duration-200 bg-indigo-500 hover:bg-indigo-600 text-white">
+                Start AR
+            </button>
+        </div>
+
+    </div>
+
+    <script>
+        // --- Custom A-Frame Component for AR Logic ---
+        AFRAME.registerComponent('ar-toolkit-controller', {
+            schema: {
+                wallHeight: { type: 'number', default: 2.5 }, // meters
+                coverageRate: { type: 'number', default: 10 }, // sq meters per liter
+                coats: { type: 'number', default: 2 }
+            },
+
+            init: function () {
+                this.scene = this.el;
+                this.reticle = document.getElementById('reticle');
+                this.statusText = document.getElementById('status-text');
+                this.modeSwitchBtn = document.getElementById('mode-switch-btn');
+                this.arStartBtn = document.getElementById('ar-start-btn');
+                
+                // State
+                this.state = {
+                    mode: 'measure', // 'measure' or 'paint'
+                    points: [],
+                    currentPaintColor: '#FF0000', // Default red paint
+                    isARActive: false
+                };
+
+                // Bind methods
+                this.onSessionStart = this.onSessionStart.bind(this);
+                this.onTap = this.onTap.bind(this);
+                this.toggleMode = this.toggleMode.bind(this);
+                this.updateUI = this.updateUI.bind(this);
+                this.calculateResults = this.calculateResults.bind(this);
+
+                // Setup Listeners
+                this.arStartBtn.addEventListener('click', () => {
+                    // Try to enter AR mode, and catch any errors to display a helpful message
+                    this.scene.components.webxr.enterAR().then(() => {
+                        // Success handled in onSessionStart
+                    }).catch(error => {
+                        console.error('AR Session Failed to Start:', error);
+                        let errorMessage = 'AR Session failed. Possible reasons: Missing camera/motion permission, or browser not compatible.';
+                        
+                        // Refine error message based on the exception
+                        if (error.message && error.message.includes('permission')) {
+                            errorMessage = 'AR Session Failed: Camera or Motion sensor permission likely denied.';
+                        } else if (error.name === 'NotSupportedError') {
+                            errorMessage = 'AR Session Failed: Device/Browser does not support the required WebXR features (hit-test/AR mode).';
+                        }
+                        
+                        // Updated status text color to be dark red for contrast on white background
+                        this.statusText.innerHTML = `<span class="text-red-700">Error: ${errorMessage}</span>`;
+                    });
+                });
+
+                this.scene.addEventListener('enter-vr', this.onSessionStart);
+                this.scene.addEventListener('exit-vr', () => {
+                    this.state.isARActive = false;
+                    this.updateUI();
+                });
+                this.modeSwitchBtn.addEventListener('click', this.toggleMode);
+                document.body.addEventListener('click', this.onTap);
+
+                this.updateUI();
+            },
+
+            tick: function () {
+                // Keep the reticle updated if we are in AR mode
+                if (this.state.isARActive) {
+                    // Check for webxr-hit-test results
+                    const hitTestResults = this.el.components.webxr.hitTestState;
+                    
+                    if (hitTestResults && hitTestResults.length > 0) {
+                        this.reticle.setAttribute('visible', true);
+                        // Use the first hit result's matrix to position the reticle
+                        this.reticle.object3D.matrix.fromArray(hitTestResults[0].hitMatrix);
+                    } else {
+                        this.reticle.setAttribute('visible', false);
+                    }
+                }
+            },
+
+            onSessionStart: function (evt) {
+                // Check if the session mode is Augmented Reality
+                if (evt.detail.session.mode === 'immersive-ar') {
+                    this.state.isARActive = true;
+                    // Updated status text color to be dark green for contrast on white background
+                    this.statusText.innerHTML = `<span class="text-green-700">AR Active. Move your phone slowly to find a surface (green reticle).</span>`;
+                    this.updateUI();
+                }
+            },
+
+            onTap: function (evt) {
+                // Ignore taps if AR is not active or if a UI button was tapped
+                if (!this.state.isARActive || evt.target.closest('button')) {
+                    return;
+                }
+
+                // Check if the reticle is visible (i.e., a surface was hit)
+                if (!this.reticle.getAttribute('visible')) {
+                    // Updated status text color to be dark red for contrast on white background
+                    this.statusText.innerHTML = `<span class="text-red-700">Error: No surface detected. Move your phone slowly.</span>`;
+                    return;
+                }
+
+                // Get the position of the reticle
+                // A-Frame ensures THREE is available globally in components
+                const hitPosition = new THREE.Vector3().setFromMatrixPosition(this.reticle.object3D.matrixWorld);
+                
+                if (this.state.mode === 'measure') {
+                    this.handleMeasureMode(hitPosition);
+                } else if (this.state.mode === 'paint') {
+                    this.handlePaintMode(hitPosition);
+                }
+            },
+
+            toggleMode: function () {
+                this.state.mode = this.state.mode === 'measure' ? 'paint' : 'measure';
+                // Reset status text color to default dark gray
+                this.statusText.innerHTML = `Mode switched to ${this.state.mode.toUpperCase()}. Tap a surface.`;
+                this.updateUI();
+                
+                // Clear state when switching modes
+                if (this.state.mode === 'measure') {
+                    this.clearPaintVisualizations();
+                } else {
+                    this.clearMeasurementMarkers();
+                }
+            },
+            
+            // --- MEASUREMENT LOGIC ---
+            handleMeasureMode: function (position) {
+                const pointIndex = this.state.points.length;
+                
+                // 1. Create a marker entity
+                const marker = document.createElement('a-sphere');
+                marker.setAttribute('position', position);
+                marker.setAttribute('radius', 0.05);
+                marker.setAttribute('color', pointIndex === 0 ? '#4CAF50' : '#2196F3');
+                marker.setAttribute('raycastable', ''); // Make sure it doesn't interfere with the raycaster
+                this.scene.appendChild(marker);
+
+                this.state.points.push({ position, entity: marker });
+
+                if (this.state.points.length >= 2) {
+                    // We have 2 or more points, calculate the distance between the last two.
+                    const p1 = this.state.points[this.state.points.length - 2].position;
+                    const p2 = this.state.points[this.state.points.length - 1].position;
+                    
+                    const distance = p1.distanceTo(p2);
+                    
+                    // 2. Draw a line between the last two points
+                    const line = document.createElement('a-entity');
+                    line.setAttribute('line', {
+                        start: `${p1.x} ${p1.y} ${p1.z}`,
+                        end: `${p2.x} ${p2.y} ${p2.z}`,
+                        color: '#FFEB3B',
+                        opacity: 0.8
+                    });
+                    this.scene.appendChild(line);
+
+                    this.state.points[this.state.points.length - 1].lineEntity = line;
+                    
+                    this.calculateResults(distance);
+                    this.statusText.innerHTML = `Placed Point ${this.state.points.length}. Measured Length: ${distance.toFixed(2)} m. Tap again to set a new start point.`;
+                    
+                    // Reset the points array for the next segment measurement
+                    this.state.points = [this.state.points[this.state.points.length - 1]];
+                } else {
+                    this.calculateResults(0); // Reset display
+                    this.statusText.innerHTML = `Placed Start Point (1/2). Tap again to set the end point.`;
+                }
+            },
+
+            clearMeasurementMarkers: function() {
+                // Remove all spheres and lines
+                const entitiesToRemove = this.scene.querySelectorAll('a-sphere[color="#4CAF50"], a-sphere[color="#2196F3"], a-entity[line]');
+                entitiesToRemove.forEach(entity => entity.remove());
+                this.state.points = [];
+                this.calculateResults(0);
+            },
+            
+            // --- PAINT VISUALIZATION LOGIC ---
+            handlePaintMode: function (position) {
+                this.clearPaintVisualizations();
+                
+                const paint = document.createElement('a-plane');
+                paint.setAttribute('position', position);
+                // The size is arbitrary, representing a large swatch on the wall
+                paint.setAttribute('width', 1.5); 
+                paint.setAttribute('height', 1.5);
+                
+                // Rotate the plane to face the user (flat on the wall)
+                const camera = this.scene.querySelector('a-camera').object3D;
+                // Get the camera's forward vector and negate it to get the normal vector of the wall plane
+                const forward = camera.getWorldDirection(new THREE.Vector3()).negate();
+                
+                // We need to calculate the rotation to align the plane's Z-axis with the wall's normal (forward vector)
+                // A-Frame planes face down the Z-axis, so we rotate it to face the direction we just calculated.
+                
+                // LookAt logic to align the plane
+                const lookAtTarget = new THREE.Vector3(position.x - forward.x, position.y - forward.y, position.z - forward.z);
+                paint.object3D.lookAt(lookAtTarget);
+
+                // Add a slight offset from the wall to prevent Z-fighting
+                paint.object3D.position.add(forward.multiplyScalar(0.001));
+
+                paint.setAttribute('material', {
+                    color: this.state.currentPaintColor,
+                    opacity: 0.9, // Slightly increased opacity
+                    side: 'double'
+                });
+                
+                paint.setAttribute('id', 'paint-viz');
+                this.scene.appendChild(paint);
+                
+                this.statusText.innerHTML = `Applied ${this.state.currentPaintColor} swatch. Change color and tap again!`;
+                
+                // Cycle through colors for demo: Red <-> Blue <-> Green
+                if (this.state.currentPaintColor === '#FF0000') {
+                    this.state.currentPaintColor = '#007FFF';
+                } else if (this.state.currentPaintColor === '#007FFF') {
+                    this.state.currentPaintColor = '#4CAF50';
+                } else {
+                    this.state.currentPaintColor = '#FF0000';
+                }
+            },
+
+            clearPaintVisualizations: function() {
+                const paintViz = document.getElementById('paint-viz');
+                if (paintViz) {
+                    paintViz.remove();
+                }
+            },
+
+            // --- UI AND CALCULATION ---
+            calculateResults: function (length) {
+                const { wallHeight, coverageRate, coats } = this.data;
+                
+                const totalArea = length * wallHeight; // Area approximation (Length * Fixed Height)
+                let volume = 0;
+                
+                if (totalArea > 0) {
+                    // Paint Volume = (Area * Coats) / Coverage Rate
+                    volume = (totalArea * coats) / coverageRate;
+                }
+
+                document.getElementById('length-display').innerText = `Measured Length: ${length.toFixed(2)} m`;
+                document.getElementById('volume-display').innerText = `Paint Volume (${coats} coats, ${coverageRate}m²/L): ${volume.toFixed(2)} Liters`;
+            },
+            
+            updateUI: function() {
+                if (this.state.isARActive) {
+                    this.arStartBtn.classList.add('hidden');
+                    this.modeSwitchBtn.classList.remove('opacity-0');
+                    this.modeSwitchBtn.disabled = false;
+                    
+                    if (this.state.mode === 'measure') {
+                        this.modeSwitchBtn.classList.replace('bg-blue-600', 'bg-green-600');
+                        this.modeSwitchBtn.innerText = "Mode: MEASURE (Tap to set points)";
+                    } else {
+                        this.modeSwitchBtn.classList.replace('bg-green-600', 'bg-blue-600');
+                        this.modeSwitchBtn.innerText = `Mode: PAINT (Next Color: ${this.state.currentPaintColor})`;
+                    }
+                } else {
+                    this.arStartBtn.classList.remove('hidden');
+                    this.modeSwitchBtn.classList.add('opacity-0');
+                    this.modeSwitchBtn.disabled = true;
+                    // Reset to default dark text on white background
+                    this.statusText.innerHTML = "Tap 'Start AR' below. (Requires compatible mobile browser)";
+                    this.clearMeasurementMarkers();
+                    this.clearPaintVisualizations();
+                }
+            }
+        });
+    </script>
+</body>
+</html>
